@@ -8,6 +8,7 @@ use near_sdk::{
 
 type EthereumAddress = [u8; 20];
 pub use lock_event::EthLockedEvent;
+pub use rebase_event::EthRebaseEvent;
 pub use log_metadata_event::TokenMetadataEvent;
 use prover::*;
 pub use prover::{validate_eth_address, Proof};
@@ -15,9 +16,10 @@ use std::convert::TryInto;
 pub use unlock_event::EthUnlockedEvent;
 
 mod lock_event;
+mod rebase_event;
+mod unlock_event;
 mod log_metadata_event;
 pub mod prover;
-mod unlock_event;
 
 near_sdk::setup_alloc!();
 
@@ -43,6 +45,14 @@ const FT_TRANSFER_CALL_GAS: Gas = 80_000_000_000_000;
 /// Gas to call finish deposit method.
 /// This doesn't cover the gas required for calling mint method.
 const FINISH_DEPOSIT_GAS: Gas = 30_000_000_000_000;
+
+//TODO: re-access the gas cost of account level rebase
+/// Gas to call finish rebase method.
+/// This doesn't cover the gas required for calling mint or burn method.
+const FINISH_REBASE_GAS: Gas = 30_000_000_000_000;
+
+/// Gas to call mint or burn function after rebase
+const REBASE_GAS: Gas = 10_000_000_000_000;
 
 /// Gas to call finish update_metadata method.
 const FINISH_UPDATE_METADATA_GAS: Gas = 5_000_000_000_000;
@@ -80,10 +90,15 @@ pub enum ResultType {
         amount: Balance,
         recipient: EthereumAddress,
     },
+    Rebase {
+        epoch: u128,
+        requested_adjustment: Balance,
+    },
 }
 
 const PAUSE_DEPLOY_TOKEN: Mask = 1 << 0;
 const PAUSE_DEPOSIT: Mask = 1 << 1;
+const PAUSE_REBASE: Mask = 1 << 2;
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
@@ -92,6 +107,8 @@ pub struct BridgeTokenFactory {
     pub prover_account: AccountId,
     /// Address of the Ethereum locker contract.
     pub locker_address: EthAddress,
+    /// Address of the Ethereum "rebaser" contract.
+    pub rebaser_address: EthAddress,
     /// Set of created BridgeToken contracts.
     pub tokens: UnorderedSet<String>,
     /// Hashes of the events that were already used.
@@ -119,6 +136,17 @@ pub trait ExtBridgeTokenFactory {
     ) -> Promise;
 
     #[result_serializer(borsh)]
+    fn finish_rebase(
+        &mut self,
+        #[callback]
+        #[serializer(borsh)]
+        verification_success: bool,
+        #[serializer(borsh)] epoch: u128,
+        #[serializer(borsh)] requested_adjustment: Balance,
+        #[serializer(borsh)] proof: Proof,
+    ) -> Promise;
+
+    #[result_serializer(borsh)]
     fn finish_updating_metadata(
         &mut self,
         #[callback]
@@ -140,6 +168,8 @@ pub trait FungibleToken {
 #[ext_contract(ext_bridge_token)]
 pub trait ExtBridgeToken {
     fn mint(&self, account_id: AccountId, amount: U128);
+
+    fn ft_rebase(&mut self, epoch: u128, requested_adjustment: Balance) -> Promise;
 
     fn ft_transfer_call(
         &mut self,
@@ -207,12 +237,14 @@ impl BridgeTokenFactory {
     /// Initializes the contract.
     /// `prover_account`: NEAR account of the Near Prover contract;
     /// `locker_address`: Ethereum address of the locker contract, in hex.
+    /// `rebaser_address`: Ethereum address of the rebaser contract, in hex.
     #[init]
-    pub fn new(prover_account: AccountId, locker_address: String) -> Self {
+    pub fn new(prover_account: AccountId, locker_address: String, rebaser_address: String) -> Self {
         assert!(!env::state_exists(), "Already initialized");
         Self {
             prover_account,
             locker_address: validate_eth_address(locker_address),
+            rebaser_address: validate_eth_address(rebaser_address),
             tokens: UnorderedSet::new(b"t".to_vec()),
             used_events: UnorderedSet::new(b"u".to_vec()),
             owner_pk: env::signer_account_pk(),
@@ -278,6 +310,7 @@ impl BridgeTokenFactory {
             FINISH_UPDATE_METADATA_GAS + SET_METADATA_GAS,
         ))
     }
+
     /// Deposit from Ethereum to NEAR based on the proof of the locked tokens.
     /// Must attach enough NEAR funds to cover for storage of the proof.
     #[payable]
@@ -318,6 +351,48 @@ impl BridgeTokenFactory {
             &env::current_account_id(),
             env::attached_deposit(),
             FINISH_DEPOSIT_GAS + MINT_GAS + FT_TRANSFER_CALL_GAS,
+        ))
+    }
+
+    /// Rebase from Ethereum to NEAR based on the proof of the rebase event.
+    /// Must attach enough NEAR funds to cover for storage of the proof and account level rebase.
+    #[payable]
+    pub fn rebase(&mut self, #[serializer(borsh)] proof: Proof) -> Promise {
+        self.check_not_paused(PAUSE_REBASE);
+        let event = EthRebaseEvent::from_log_entry_data(&proof.log_entry_data);
+        assert_eq!(
+            event.rebaser_address,
+            self.rebaser_address,
+            "Event's address {} does not match rebaser address of this token {}",
+            hex::encode(&event.rebaser_address),
+            hex::encode(&self.rebaser_address),
+        );
+        assert!(
+            self.tokens.contains(&event.token),
+            "Bridge token for {} is not deployed yet",
+            event.token
+        );
+        let proof_1 = proof.clone();
+
+        ext_prover::verify_log_entry(
+            proof.log_index,
+            proof.log_entry_data,
+            proof.receipt_index,
+            proof.receipt_data,
+            proof.header_data,
+            proof.proof,
+            false, // Do not skip bridge call. This is only used for development and diagnostics.
+            &self.prover_account,
+            NO_DEPOSIT,
+            VERIFY_LOG_ENTRY_GAS,
+        )
+        .then(ext_self::finish_rebase(
+            event.epoch,
+            event.requested_adjustment,
+            proof_1,
+            &env::current_account_id(),
+            NO_DEPOSIT,
+            FINISH_REBASE_GAS + REBASE_GAS,
         ))
     }
 
@@ -432,6 +507,57 @@ impl BridgeTokenFactory {
                 MINT_GAS,
             ),
         }
+    }
+
+        /// ration nRebase_token using supplyDelta aka requested_adjustment
+    /// across NEAR accounts holding nRebase_token according to 
+    /// the NEAR account's quota of total_supply
+    #[payable]
+    pub fn finish_rebase(
+        &mut self,
+        #[callback]
+        #[serializer(borsh)]
+        verification_success: bool,
+        #[serializer(borsh)] epoch: u128,
+        #[serializer(borsh)] requested_adjustment: Balance,
+        #[serializer(borsh)] proof: Proof,
+    ) -> Promise {
+        assert_self();
+        assert!(verification_success, "Failed to verify the proof");
+        let token = env::predecessor_account_id();
+        let parts: Vec<&str> = token.split(".").collect();
+        assert_eq!(
+            token,
+            format!("{}.{}", parts[0], env::current_account_id()),
+            "Only sub accounts of BridgeTokenFactory can call this method."
+        );
+        assert!(
+            self.tokens.contains(&parts[0].to_string()),
+            "Such BridgeToken does not exist."
+        );
+
+        let required_deposit = self.record_proof(&proof);
+
+        assert!(
+            env::attached_deposit()
+                >= required_deposit + self.bridge_token_storage_deposit_required
+        );
+
+        env::log(
+            format!(
+                "Finish rebase. epoch:{} requested_adjustment:{}",
+                epoch, requested_adjustment
+            )
+            .as_bytes(),
+        );
+
+        ext_bridge_token::ft_rebase(
+            epoch.into(),
+            requested_adjustment.into(),
+            &self.get_bridge_token_account_id(token.clone()),
+            env::attached_deposit() - required_deposit,
+            REBASE_GAS,
+        )
     }
 
     /// Burn given amount of tokens and unlock it on the Ethereum side for the recipient address.

@@ -4,6 +4,8 @@
 
 ## Ethereum's side
 
+### note: this is work in progress
+
 ```solidity
 contract ERC20Locker {
   constructor(bytes memory nearTokenFactory, INearProver prover) public;
